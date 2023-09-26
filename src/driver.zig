@@ -52,10 +52,10 @@ pub const RootAllocator = struct {
     meta: u32,
 
     pub fn init(self: *@This(), allocer:Allocator) !void {
-        @atomicStore(u32, &self.meta, 0, AtomicOrder.Unordered);
-        const page_ = try self.root_allocator.alloc(HugePage, 1);
-        self.hugepage_head.set(@ptrCast(page_));
+        @atomicStore(u32, &self.meta, 0, AtomicOrder.Monotonic);
         self.root_allocator = allocer;
+        const page_ = try allocer.alloc(HugePage, 1);
+        self.hugepage_head.set(@ptrCast(page_));
     }
     // pub fn refill(self:*@This(), page_source: InfailablePageProvider) !void {
 
@@ -145,8 +145,8 @@ const SomeInfailablePageProvider = struct {
         self.data = @ptrCast(object_ref);
         self.get_free_page_fn = @ptrCast(&PointeeTy.get_page);
     }
-    fn get_page(self:*const @This()) *GenericPage {
-        return self.get_free_page_fn(self.data);
+    fn get_page(self:*const @This()) Allocator.Error!*GenericPage {
+        return try self.get_free_page_fn(self.data);
     }
 };
 pub const InfailablePageProvider = struct {
@@ -197,14 +197,11 @@ pub const RegionAllocator = struct {
     ) !OpaqueObjectRef {
         const max_object_size = page_size - @sizeOf(Segment);
         if (object_size > max_object_size) {
-            const msg = std.fmt.comptimePrint(
-                "Object size is {} bytes, but maximum alowed allocation size for one object is {} bytes",
-                .{object_size, max_object_size});
-            @compileError(msg);
+            @panic("Invalid size not handled prior");
         }
-        if (@sizeOf(GenericPage) == @sizeOf(Segment)) {
+        comptime if (@sizeOf(GenericPage) == @sizeOf(Segment)) {
             @compileError("(page size / segment size) is not greater then 1");
-        }
+        };
         const not_initialised = self.page_start.is_null();
         if (not_initialised) {
             try self.do_initial_setup(ralloc);
@@ -212,7 +209,7 @@ pub const RegionAllocator = struct {
         }
         const segment_occupation_count =
             @as(usize,@intCast(object_size / @sizeOf(Segment)));
-        const fits_within_segment = comptime segment_occupation_count == 0;
+        const fits_within_segment = segment_occupation_count == 0;
         if (fits_within_segment) {
             loop: while(true) {
                 if (self.is_dangling()) {
@@ -239,15 +236,14 @@ pub const RegionAllocator = struct {
                 self.allocation_tail.addr = new_tail;
                 var ref_ : OpaqueObjectRef = undefined;
                 ref_.tag = .SingleItemRef;
-                var cmp_ptr : ptr.CompressedPtr(
-                    u8, ptr.@"Byte amount fitting within 48 bit address space", true) = undefined;
-                cmp_ptr.set(@ptrFromInt(addr));
-                ref_.payload.single = cmp_ptr;
+                var ptr_ : @TypeOf(ref_.payload.single)= undefined;
+                ptr_.set(@ptrFromInt(addr));
+                ref_.payload.single = ptr_;
                 return ref_;
             }
         } else {
             const segment_occupation_count_ =
-                comptime if (@sizeOf(Segment) * segment_occupation_count < object_size) segment_occupation_count + 1
+                if (@sizeOf(Segment) * segment_occupation_count < object_size) segment_occupation_count + 1
                 else segment_occupation_count;
             if (self.is_dangling()) {
                 try self.pagein(ralloc);
@@ -270,17 +266,16 @@ pub const RegionAllocator = struct {
                 const fits_in_remaining_space = tail_alloc_addr <= page_boundry_addr;
                 if (fits_in_remaining_space) {
                     var ref : OpaqueObjectRef = undefined;
-                    var cmptr : @TypeOf(ref.payload.multi.ptr) = undefined;
-                    cmptr.set(@ptrFromInt(alloc_start_addr));
-
                     ref.tag = .MultisegmentRef;
-                    ref.payload.multi.ptr = cmptr;
+                    var ptr_ : @TypeOf(ref.payload.multi.ptr) = undefined;
+                    ptr_.set(@ptrFromInt(alloc_start_addr));
+                    ref.payload.multi.ptr = ptr_;
                     ref.payload.multi.segment_count = @truncate(segment_occupation_count_);
 
                     self.current_sub_block.advance(segment_occupation_count_);
                     self.allocation_tail = self.current_sub_block.as_raw();
                     // set mark which segments were taken
-                    const index_range: u64 = (@as(u64, 1) << segment_occupation_count_) - 1;
+                    const index_range: u64 = (@as(u64, 1) << @intCast(segment_occupation_count_)) - 1;
                     const mask = index_range << self.sub_block_index;
                     _ = @atomicRmw(
                         u64,
@@ -333,7 +328,7 @@ pub const RegionAllocator = struct {
     }
     fn setup_current_segment(self:*@This()) void {
         var ptr_ = self.current_sub_block;
-        @atomicStore(u16, &ptr_.get().header.ref_count, 1, AtomicOrder.Unordered);
+        @atomicStore(u16, &ptr_.get().header.ref_count, 1, AtomicOrder.Monotonic);
         ptr_.add_bytes(@sizeOf(SlabBlockMtd));
         self.allocation_tail = ptr_.as_raw();
         const mask : u64 = @as(u64,1) << self.sub_block_index;
@@ -350,13 +345,13 @@ pub const RegionAllocator = struct {
             u64,
             &header.segment_occupation_map,
             1,
-            AtomicOrder.Unordered);
+            AtomicOrder.Monotonic);
         @atomicStore(
-            u16, &header.ref_count, 1, AtomicOrder.Unordered);
+            u16, &header.ref_count, 1, AtomicOrder.Monotonic);
         header.next_page = null;
         self.allocation_tail.add_bytes(@sizeOf(RAllocMtd));
     }
-    fn pagein(self:*@This(), palloc:*InfailablePageProvider) !void {
+    fn pagein(self:*@This(), palloc:SomeInfailablePageProvider) !void {
         const new_page = try palloc.get_page();
         const addr = @intFromPtr(new_page);
         self.current_write_page.get().header.next_page = @ptrCast(new_page);
@@ -495,9 +490,11 @@ pub const WorkGroup = struct {
     host_allocator: Allocator,
     root_allocator: RootAllocator,
     occupation_registry: u64, // 1 for available, 0 for taken
-    ref_count: u32,
+    external_ref_count: u32,
     inline_workers: [16]Worker,
+    all_idle_mask: u64,
     worker_count: u32,
+    group_destruction_began: bool,
 
     pub fn new(page_source: Allocator) !WorkGroupRef {
         const cpu_count : u32 = @intCast(@min(16,try std.Thread.getCpuCount())); // todo fixme
@@ -505,12 +502,18 @@ pub const WorkGroup = struct {
         var host_alloc = page_source;
         var wg : *WorkGroup = @ptrCast(try host_alloc.alloc(WorkGroup, 1));
         try wg.root_allocator.init(host_alloc);
-        @atomicStore(u32, &wg.ref_count, 1, AtomicOrder.Unordered);
+        @atomicStore(u32, &wg.external_ref_count, 1, AtomicOrder.Monotonic);
         const occupation_bits : usize =
             if (cpu_count == 64) ~@as(u64,0) else (@as(u64, 1) << @intCast(cpu_count)) - 1;
-        @atomicStore(u64, &wg.occupation_registry, occupation_bits, AtomicOrder.Unordered);
+        wg.all_idle_mask = occupation_bits;
+        @atomicStore(u64, &wg.occupation_registry, occupation_bits, AtomicOrder.Monotonic);
         wg.host_allocator = host_alloc;
         wg.worker_count = cpu_count;
+        @atomicStore(
+            bool,
+            &wg.group_destruction_began,
+            false,
+            AtomicOrder.Monotonic);
 
         var ix : u32 = 0;
         while (true) {
@@ -527,8 +530,25 @@ pub const WorkGroup = struct {
         wref.ptr = wg;
         return wref;
     }
-    fn destroy(self:*@This()) void {
-        _ = self;
+    fn external_side_destroy(self:*@This()) void {
+        var ix:u32 = 0;
+        const limit = self.worker_count;
+        while (true) {
+            const worker = self.get_worker_at_index(ix);
+            const outcome = @cmpxchgStrong(
+                bool,
+                &worker.flags.was_started,
+                true, true,
+                AtomicOrder.Monotonic, AtomicOrder.Monotonic);
+            const was_started = outcome == null;
+            if (was_started) {
+                worker.flags.kill_self = true;
+                worker.wakeup();
+                worker.thread.?.join();
+            }
+            ix += 1;
+            if (ix == limit) break;
+        }
     }
     fn try_find_unoccupied_index(self:*@This()) ?u64 {
         var bits : u64 = (1 << 64) - 1;
@@ -599,17 +619,17 @@ pub const WorkGroupRef = struct {
                 initial_task.frame_ptr = frame;
 
                 var ptr_ : ptr.Ptr(TaskFrame_ResumesThread, true) = undefined;
-                ptr_.set(@ptrCast(frame.get_data_ptr()));
+                ptr_.set(@alignCast(@ptrCast(frame.get_data_ptr())));
 
                 const frame_header = ptr_.get();
                 frame_header.child_task_count = 0;
                 frame_header.resume_flag = &resume_flag;
 
-                const data_ptr = ptr_;
+                var data_ptr = ptr_;
                 data_ptr.add_bytes(aligned_for_data);
                 data_ptr.rebind_to(@TypeOf(capture)).get().* = capture;
 
-                exported.task_set.push(initial_task);
+                _ = exported.task_set.push(initial_task);
             }
             free_worker.end_safe_sync_access();
             free_worker.wakeup();
@@ -622,20 +642,42 @@ pub const WorkGroupRef = struct {
         // wait til submited task is completed
         while (true) {
             std.Thread.Futex.wait(&resume_flag, 0);
-            if (resume_flag.load(AtomicOrder.Monotonic) == (1 << 32) - 1) break;
+            if (resume_flag.load(AtomicOrder.Monotonic) == 1) break;
         }
     }
     pub fn submit_task(self:*const @This()) void {
         _ = self;
     }
     pub fn clone_ref(self:*const @This()) WorkGroupRef {
-        _ = @atomicRmw(u32, &self.ptr.ref_count, AtomicRmwOp.Add, 1, AtomicOrder.Monotonic);
+        _ = @atomicRmw(u32, &self.ptr.external_ref_count, AtomicRmwOp.Add, 1, AtomicOrder.Monotonic);
         return self.*;
     }
     pub fn done_here(self:*const @This()) void {
-        const prior = @atomicRmw(u32, &self.ptr.ref_count, AtomicRmwOp.Sub, 1, AtomicOrder.Release);
-        const last_observer = prior == 1;
-        if (last_observer) self.ptr.destroy();
+        const prior_ref_count = @atomicRmw(
+            u32, &self.ptr.external_ref_count, AtomicRmwOp.Sub, 1, AtomicOrder.Monotonic);
+        const last_observer = prior_ref_count == 1;
+        const all_idle_mask = self.ptr.all_idle_mask;
+        const outcome = @cmpxchgStrong(
+            u64,
+            &self.ptr.occupation_registry,
+            all_idle_mask,
+            all_idle_mask,
+            AtomicOrder.Monotonic,
+            AtomicOrder.Monotonic);
+        const all_idle = outcome == null;
+        const dispose = last_observer and all_idle;
+        if (dispose) {
+            const outcome_ = @cmpxchgStrong(
+                bool,
+                &self.ptr.group_destruction_began,
+                false,
+                true,
+                AtomicOrder.Monotonic,
+                AtomicOrder.Monotonic);
+            const already_began = outcome_ != null;
+            if (already_began) return
+            else self.ptr.external_side_destroy();
+        }
     }
 };
 
@@ -653,6 +695,7 @@ pub const Worker = struct {
     exported_worker_local_data: ?*WorkerExportData,
     shared_task_pack: TaskPackPtr,
     flags: struct {
+        kill_self: bool,
         was_started: bool,
         transaction_state: CrossWorkerTransactionState
     },
@@ -666,7 +709,7 @@ pub const Worker = struct {
         @atomicStore(
             CrossWorkerTransactionState,
             &self.flags.transaction_state,
-            .ReadyToRecieve,
+            .Finished,
             AtomicOrder.Monotonic);
     }
     pub fn start(self:*@This()) !void {
@@ -708,7 +751,8 @@ pub const Worker = struct {
             .Finished,
             AtomicOrder.Release);
     }
-    pub fn hibernate(self:*@This()) void {
+    // true if should suicide
+    pub fn hibernate(self:*@This()) bool {
         while (true) {
             const outcome = @cmpxchgStrong(
                 CrossWorkerTransactionState,
@@ -717,13 +761,48 @@ pub const Worker = struct {
                 .ReadyToRecieve,
                 AtomicOrder.Acquire,
                 AtomicOrder.Monotonic);
-            if (outcome == null) break;
+            if (outcome == null) return false;
             // its good idead to perform mem defrag here
             std.Thread.Futex.wait(&self.futex_wake_location, 0);
+            if (self.flags.kill_self) return true;
         }
     }
     pub fn wakeup(self:*const @This()) void {
         std.Thread.Futex.wake(&self.futex_wake_location, 1);
+    }
+    // true if all idle
+    pub fn advertise_as_available(self:*@This()) bool {
+        const mask = @as(u64,1) << @intCast(self.worker_index);
+        const prior_occupation_map = @atomicRmw(
+            u64,
+            &self.work_group_ref.occupation_registry,
+            AtomicRmwOp.Or,
+            mask,
+            AtomicOrder.Monotonic);
+        const all_idle = prior_occupation_map | mask == self.work_group_ref.all_idle_mask;
+        return all_idle;
+    }
+    pub fn internal_side_dispose(self:*@This()) void {
+        var ix:u32 = 0;
+        const work_group = self.work_group_ref;
+        const limit = work_group.worker_count;
+        while (true) {
+            if (ix == self.worker_index) { continue; }
+            const outcome = @cmpxchgStrong(
+                bool,
+                &self.flags.was_started,
+                true, true,
+                AtomicOrder.Monotonic, AtomicOrder.Monotonic);
+            const was_started = outcome == null;
+            if (was_started) {
+                const worker_ = work_group.get_worker_at_index(ix);
+                worker_.flags.kill_self = true;
+                worker_.wakeup();
+                worker_.thread.?.join();
+            }
+            ix += 1;
+            if (ix == limit) break;
+        }
     }
 };
 const TaskPack = @Vector(16, u128);
@@ -748,7 +827,7 @@ const Combiner = struct {
         const page : *CombinerPage = @ptrCast(try allocer.get_page());
         page.header.next_page.set_null();
         const map = (1 << (@sizeOf(GenericPage) / @sizeOf(Segment))) - 1;
-        @atomicStore(u64, &page.header.occupation_map, map, AtomicOrder.Unordered);
+        @atomicStore(u64, &page.header.occupation_map, map, AtomicOrder.Monotonic);
         self.page_start.set(page);
         self.current_write_page.set(page);
         self.current_segment_read_ptr.addr = @intFromPtr(page);
@@ -763,7 +842,7 @@ const Combiner = struct {
             u16,
             &self.current_write_page.get().header.ref_count,
             1,
-            AtomicOrder.Unordered);
+            AtomicOrder.Monotonic);
         self.segment_ptr.addr = @intFromPtr(page);
         self.segment_ptr.advance(1);
     }
@@ -781,7 +860,7 @@ const Combiner = struct {
                 u16,
                 &self.page_start.get().header.ref_count,
                 1,
-                AtomicOrder.Unordered);
+                AtomicOrder.Monotonic);
             self.segment_ptr.addr = self.page_start.addr;
             self.segment_ptr.advance(1);
         } else {
@@ -889,13 +968,20 @@ const TaskFrame_Subtask = packed struct {
     child_task_count: u64,
     resumption_task_lot: ObjectRef(Task)
 };
+comptime {
+    const counterOffsetOk1 =
+        @offsetOf(TaskFrame_Standalone, "child_task_count") ==
+        @offsetOf(TaskFrame_ResumesThread, "child_task_count");
+    if (!counterOffsetOk1) @compileError("Invalid counter offset");
+    const counterOffsetOk2 =
+        @offsetOf(TaskFrame_Standalone, "child_task_count") ==
+        @offsetOf(TaskFrame_Subtask, "child_task_count");
+    if (!counterOffsetOk2) @compileError("Invalid counter offset");
+}
 
 fn worker_processing_routine(worker: *Worker) void {
-    _ = @atomicStore(
-        CrossWorkerTransactionState,
-        &worker.flags.transaction_state,
-        .ReadyToRecieve,
-        AtomicOrder.Monotonic);
+
+    worker.flags.kill_self = false;
     // const work_group = worker.work_group_ref;
 
     var export_context : WorkerExportData = undefined;
@@ -915,56 +1001,49 @@ fn worker_processing_routine(worker: *Worker) void {
     quantum: while (true) {
         if (export_context.task_set.pop()) |task| curernt_task = task
         else {
-            // do we have something in share slot
-            const smth = @cmpxchgStrong(
-                u64,
-                @as(*u64,@ptrCast(&worker.shared_task_pack)),
+            // mark as available for consumption
+            const all_idle = worker.advertise_as_available();
+            const outcome = @cmpxchgStrong(
+                u32,
+                &worker.work_group_ref.external_ref_count,
                 0,
                 0,
-                AtomicOrder.Acquire, AtomicOrder.Monotonic);
-            if (smth) |pack| {
-                // we do
-                const pack_ = @as(TaskPackPtr,@bitCast(@as(u56,@intCast(pack))));
-                _ = pack_;
-            } else {
-                const prior = @atomicRmw(
-                    u32,
-                    &worker.work_group_ref.ref_count,
-                    AtomicRmwOp.Sub,
-                    1,
+                AtomicOrder.Monotonic,
+                AtomicOrder.Monotonic);
+            const no_external_references = outcome == null;
+            const should_dispose_workgroup = all_idle and no_external_references;
+            if (should_dispose_workgroup) {
+                // release any resource
+                const outcome_ = @cmpxchgStrong(
+                    bool,
+                    &worker.work_group_ref.group_destruction_began,
+                    false, true,
+                    AtomicOrder.Monotonic,
                     AtomicOrder.Monotonic);
-                const last_observer = prior == 1;
-                if (last_observer) {
-                    // lets dismantle this thing.
-                    // release acquired memory.
-                    // et c.
-                    break :quantum;
+                const already_began = outcome_ != null;
+                if (already_began) return
+                else {
+                    worker.internal_side_dispose();
                 }
-                _ = @atomicRmw(
-                    u64,
-                    &worker.work_group_ref.occupation_registry,
-                    AtomicRmwOp.And,
-                    ~(@as(u64,1) << @intCast(worker.worker_index)),
-                    AtomicOrder.Monotonic);
-                worker.hibernate();
-                @fence(AtomicOrder.AcqRel);
-                _ = @atomicRmw(
-                    u32,
-                    &worker.work_group_ref.ref_count,
-                    AtomicRmwOp.Add,
-                    1,
-                    AtomicOrder.Monotonic);
-                continue :quantum;
+                return;
+            } else {
+                const suicide = worker.hibernate();
+                if (suicide) {
+                    // release resources
+                    return;
+                } else {
+                    continue :quantum;
+                }
             }
         }
         const action_ptr = curernt_task.action_ptr.get();
         switch (curernt_task.meta0.action_type) {
             .Then => {
-                const data_ptr = curernt_task.frame_ptr.get_data_ptr();
+                const components = curernt_task.get_components();
                 fast_path:while (true) {
                     var action =
                         @as(*const fn (*const TaskContext, *anyopaque) Continuation, @ptrCast(action_ptr));
-                    const outcome = action(&task_ctx, data_ptr);
+                    const outcome = action(&task_ctx, components.data_ptr);
                     // we need to deal with subtasks
                     switch (outcome.payload) {
                         .Then => |data| {
@@ -972,7 +1051,19 @@ fn worker_processing_routine(worker: *Worker) void {
                             continue :fast_path;
                         },
                         .Done => {
-                            // delete resources
+                            switch (curernt_task.meta0.frame_layout) {
+                                .ThreadResumer => {
+                                    const header = @as(*TaskFrame_ResumesThread,@alignCast(@ptrCast(components.header_ptr)));
+                                    header.resume_flag.store(1, AtomicOrder.Monotonic);
+                                    std.Thread.Futex.wake(header.resume_flag, 1);
+                                },
+                                .Standalone => {
+
+                                },
+                                .TaskResumer => {
+
+                                }
+                            }
                             continue :quantum;
                         }
                     }
@@ -1012,6 +1103,24 @@ const Task = packed struct {
         ptr_.set(@ptrCast(fptr));
         self.action_ptr = ptr_;
     }
+    fn get_components(self:@This()) struct {
+        header_ptr: *anyopaque,
+        data_ptr: *anyopaque
+    } {
+        const frame_addr = @intFromPtr(self.frame_ptr.get_data_ptr());
+        const header_size:usize = switch (self.meta0.frame_layout) {
+            .Standalone => @sizeOf(TaskFrame_Standalone),
+            .ThreadResumer => @sizeOf(TaskFrame_ResumesThread),
+            .TaskResumer => @sizeOf(TaskFrame_Subtask)
+        };
+        const past_header_addr = frame_addr + header_size;
+        const align_order = self.meta0.data_alignment_order;
+        const data_addr =
+            if (align_order == 0) past_header_addr
+            else std.mem.alignForward(
+                usize, past_header_addr, @as(usize,1) << @intCast(align_order));
+        return .{.header_ptr = @ptrFromInt(frame_addr), .data_ptr = @ptrFromInt(data_addr) };
+    }
 
 };
 comptime {
@@ -1038,11 +1147,11 @@ test "ralocing" {
     var items : [n]OpaqueObjectRef = undefined;
     for (0 .. n) |ix| {
         const ref = try sralloc.alloc_bytes(@sizeOf(Item),@alignOf(Item), hui);
-        @as(*Item,@ptrCast(ref.get_data_ref())).* = @intCast(ix);
+        @as(*Item,@alignCast(@ptrCast(ref.get_data_ptr()))).* = @intCast(ix);
         items[ix] = ref;
     }
     for (0 .. n) |ix| {
-        const val = @as(*u32,@ptrCast(items[ix].get_data_ref())).*;
+        const val = @as(*u32,@alignCast(@ptrCast(items[ix].get_data_ptr()))).*;
         if (val != ix) {
             std.debug.print("Expected {} got {}", .{ix, val});
         }
@@ -1054,11 +1163,12 @@ test "ralocing" {
 test "wg init" {
     const wg = try WorkGroup.new(std.heap.page_allocator);
     const T = struct {
-        fn jopa(_: *const TaskContext, capture: **const [11:0]u8) Continuation {
-            std.debug.print("{s}", .{capture.*});
+        fn jopa(_: *const TaskContext, capture: *u32) Continuation {
+            std.debug.print("{}", .{capture.*});
             return Continuation { .payload = .Done };
         }
     };
-    try wg.submit_task_and_await("hello bitch", T.jopa);
+    try wg.submit_task_and_await(@as(u32,1111), T.jopa);
+    wg.done_here();
 }
 

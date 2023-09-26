@@ -9,7 +9,7 @@ pub fn Ptr(comptime Pointee: type, comptime is_mutable: bool) type {
     const Ty = if (is_mutable) *Pointee else *const Pointee;
     return struct {
         addr: usize = 0,
-        pub fn get(self: *const @This()) Ty {
+        pub fn get(self: @This()) Ty {
             return @ptrFromInt(self.addr);
         }
         pub fn set(self: *@This(), ptr: Ty) void {
@@ -21,23 +21,23 @@ pub fn Ptr(comptime Pointee: type, comptime is_mutable: bool) type {
         pub fn add_bytes(self: *@This(), byte_count: usize) void {
             self.addr += byte_count;
         }
-        pub fn alignment_offset_for(self: *const @This(), desired_alignment: usize) usize {
+        pub fn alignment_offset_for(self: @This(), desired_alignment: usize) usize {
             return std.mem.alignForward(usize, self.addr, desired_alignment) - self.addr;
         }
         pub fn align_for(self: *@This(), desired_alignment: usize) void {
             self.addr = std.mem.alignForward(usize, self.addr, desired_alignment);
         }
-        pub fn is_aligned_for(self: *const @This(), alignment: usize) bool {
+        pub fn is_aligned_for(self: @This(), alignment: usize) bool {
             return std.mem.alignForward(usize, self.addr, alignment) == self.addr;
         }
         pub fn as_raw(self: *@This()) Ptr(u8, is_mutable) {
             return Ptr(u8, is_mutable){ .addr = self.addr };
         }
-        pub fn rebind_to(self: *const @This(), comptime T: type) Ptr(T, is_mutable) {
+        pub fn rebind_to(self: @This(), comptime T: type) Ptr(T, is_mutable) {
             if (!self.is_aligned_for(@alignOf(T))) @panic("Provided ptr is not aligned for " ++ @typeName(T));
             return Ptr(T, is_mutable){ .addr = self.addr };
         }
-        pub fn is_null(self: *const @This()) bool {
+        pub fn is_null(self: @This()) bool {
           return self.addr == 0;
         }
         pub fn set_null(self: *@This()) void {
@@ -62,6 +62,7 @@ pub fn CompressedPtr(
     const full_ptr_bit_width = bitwidth_for_byte_granularity_ptr(address_space_byte_size);
     const spare_trailing_bits_count = full_ptr_bit_width - minimal_ptr_bit_width;
     const PtrTy = if (is_mutable) *Pointee else *const Pointee;
+
     return packed struct {
         address: MinimalPtrBitwidth = 0,
         pub fn get(self: @This()) PtrTy {
@@ -73,7 +74,7 @@ pub fn CompressedPtr(
         }
         pub fn set(self: *@This(), ptr: PtrTy) void {
             const addr = @intFromPtr(ptr) >> spare_trailing_bits_count;
-            self.address = @truncate(addr);
+            self.address = @intCast(addr);
         }
         pub fn advance(self: *@This(), count: MinimalPtrBitwidth) void {
             self.address += count;
@@ -179,4 +180,19 @@ test "alignment works" {
     ptr.align_for(@alignOf(u16));
     ptr.rebind_to(u16).get().* = 0;
     std.debug.assert(vals[2] == 0 and vals[3] == 0 and vals[0] == u8max and vals[1] == u8max);
+}
+
+test "geting from packed" {
+    const T = packed struct {
+        ptr: CompressedPtr(u8, @"Byte amount fitting within 48 bit address space", true)
+    };
+    var t : T=  undefined;
+    t.ptr.set(@ptrCast(&t));
+    try std.testing.expect(t.ptr.get() == @as(*u8,@ptrCast(&t)));
+}
+
+test "allocation sizes" {
+    const t = try std.testing.allocator.alloc(u32, 1);
+    std.debug.print("{*}", .{@as(*u32,@ptrCast(t))});
+    std.testing.allocator.destroy(@as(*[1]u32,@ptrCast(t)));
 }
