@@ -486,15 +486,18 @@ fn ObjectRef(comptime T: type) type {
 // const WorkGroupCreationFailure = error {
 
 // };
+const OperationState = enum {
+    Normal, ShutdownStarted, ShutdownFinished
+};
 pub const WorkGroup = struct {
     host_allocator: Allocator,
     root_allocator: RootAllocator,
     occupation_registry: u64, // 1 for available, 0 for taken
     external_ref_count: u32,
-    inline_workers: [16]Worker,
     all_idle_mask: u64,
     worker_count: u32,
-    group_destruction_began: bool,
+    operation_state: OperationState,
+    inline_workers: [16]Worker,
 
     pub fn new(page_source: Allocator) !WorkGroupRef {
         const cpu_count : u32 = @intCast(@min(16,try std.Thread.getCpuCount())); // todo fixme
@@ -509,11 +512,7 @@ pub const WorkGroup = struct {
         @atomicStore(u64, &wg.occupation_registry, occupation_bits, AtomicOrder.Monotonic);
         wg.host_allocator = host_alloc;
         wg.worker_count = cpu_count;
-        @atomicStore(
-            bool,
-            &wg.group_destruction_began,
-            false,
-            AtomicOrder.Monotonic);
+        @atomicStore(OperationState, &wg.operation_state, .Normal, AtomicOrder.Monotonic);
 
         var ix : u32 = 0;
         while (true) {
@@ -521,7 +520,7 @@ pub const WorkGroup = struct {
             wref.init_defaults();
             wref.work_group_ref = wg;
             wref.worker_index = ix;
-            wref.futex_wake_location.value = 0;
+            wref.futex_wake_object.value = 0;
 
             ix += 1;
             if (ix == cpu_count) break;
@@ -542,7 +541,8 @@ pub const WorkGroup = struct {
                 AtomicOrder.Monotonic, AtomicOrder.Monotonic);
             const was_started = outcome == null;
             if (was_started) {
-                worker.flags.kill_self = true;
+                worker.futex_wake_object.store(
+                    @intFromEnum(WorkerSignal.WakeToDie), AtomicOrder.Monotonic);
                 worker.wakeup();
                 worker.thread.?.join();
             }
@@ -656,27 +656,8 @@ pub const WorkGroupRef = struct {
         const prior_ref_count = @atomicRmw(
             u32, &self.ptr.external_ref_count, AtomicRmwOp.Sub, 1, AtomicOrder.Monotonic);
         const last_observer = prior_ref_count == 1;
-        const all_idle_mask = self.ptr.all_idle_mask;
-        const outcome = @cmpxchgStrong(
-            u64,
-            &self.ptr.occupation_registry,
-            all_idle_mask,
-            all_idle_mask,
-            AtomicOrder.Monotonic,
-            AtomicOrder.Monotonic);
-        const all_idle = outcome == null;
-        const dispose = last_observer and all_idle;
-        if (dispose) {
-            const outcome_ = @cmpxchgStrong(
-                bool,
-                &self.ptr.group_destruction_began,
-                false,
-                true,
-                AtomicOrder.Monotonic,
-                AtomicOrder.Monotonic);
-            const already_began = outcome_ != null;
-            if (already_began) return
-            else self.ptr.external_side_destroy();
+        if (last_observer) {
+            self.ptr.external_side_destroy();
         }
     }
 };
@@ -690,27 +671,20 @@ const WorkerInitFlags = enum(u8) {
 pub const Worker = struct {
     work_group_ref: *WorkGroup,
     thread: ?std.Thread,
-    futex_wake_location: atomic.Atomic(u32),
+    futex_wake_object: atomic.Atomic(u32),
     worker_index: u32,
     exported_worker_local_data: ?*WorkerExportData,
     shared_task_pack: TaskPackPtr,
     flags: struct {
-        kill_self: bool,
         was_started: bool,
-        transaction_state: CrossWorkerTransactionState
     },
 
     pub fn init_defaults(self:*@This()) void {
         self.thread = null;
-        self.futex_wake_location.value = 0;
+        self.futex_wake_object.store(@intFromEnum(WorkerSignal.None), AtomicOrder.Monotonic);
         self.exported_worker_local_data = null;
         self.shared_task_pack.set_null();
-        self.flags.was_started = false;
-        @atomicStore(
-            CrossWorkerTransactionState,
-            &self.flags.transaction_state,
-            .Finished,
-            AtomicOrder.Monotonic);
+        @atomicStore(bool, &self.flags.was_started, false, AtomicOrder.Monotonic);
     }
     pub fn start(self:*@This()) !void {
         const flag = @cmpxchgStrong(
@@ -736,20 +710,17 @@ pub const Worker = struct {
             AtomicOrder.Monotonic);
         if (was_started != null) @panic("Attempt to sync with worker that was not started");
         while (true) {
-            const transaction_state = @atomicLoad(
-                CrossWorkerTransactionState, &self.flags.transaction_state, AtomicOrder.Monotonic);
-            switch (transaction_state) {
-                .ReadyToRecieve => { @fence(AtomicOrder.Acquire); return; },
+            const signal: WorkerSignal = @enumFromInt(
+                self.futex_wake_object.load(AtomicOrder.Monotonic));
+            switch (signal) {
+                .Sleeping => { @fence(AtomicOrder.Acquire); return; },
                 else => continue,
             }
         }
     }
     pub fn end_safe_sync_access(self:*@This()) void {
-        @atomicStore(
-            CrossWorkerTransactionState,
-            &self.flags.transaction_state,
-            .Finished,
-            AtomicOrder.Release);
+        self.futex_wake_object.store(
+            @intFromEnum(WorkerSignal.WakeToWork), AtomicOrder.Release);
     }
     // true if should suicide
     pub fn hibernate(self:*@This()) bool {
@@ -759,16 +730,24 @@ pub const Worker = struct {
                 &self.flags.transaction_state,
                 .Finished,
                 .ReadyToRecieve,
-                AtomicOrder.Acquire,
+                AtomicOrder.AcqRel,
                 AtomicOrder.Monotonic);
             if (outcome == null) return false;
             // its good idead to perform mem defrag here
-            std.Thread.Futex.wait(&self.futex_wake_location, 0);
-            if (self.flags.kill_self) return true;
+            const signal = @cmpxchgWeak(
+                OperationState,
+                &self.work_group_ref.operation_state,
+                .ShutdownStarted,
+                .ShutdownStarted,
+                AtomicOrder.Monotonic,
+                AtomicOrder.Monotonic);
+
+            if (signal == (1 << 32) - 1) return true;
+            std.Thread.Futex.wait(&self.futex_wake_object, 0);
         }
     }
     pub fn wakeup(self:*const @This()) void {
-        std.Thread.Futex.wake(&self.futex_wake_location, 1);
+        std.Thread.Futex.wake(&self.futex_wake_object, 1);
     }
     // true if all idle
     pub fn advertise_as_available(self:*@This()) bool {
@@ -787,18 +766,19 @@ pub const Worker = struct {
         const work_group = self.work_group_ref;
         const limit = work_group.worker_count;
         while (true) {
-            if (ix == self.worker_index) { continue; }
+            if (ix == self.worker_index) { ix += 1; continue; }
+            const worker = self.work_group_ref.get_worker_at_index(ix);
             const outcome = @cmpxchgStrong(
                 bool,
-                &self.flags.was_started,
-                true, true,
+                &worker.flags.was_started,
+                true,
+                true,
                 AtomicOrder.Monotonic, AtomicOrder.Monotonic);
             const was_started = outcome == null;
             if (was_started) {
-                const worker_ = work_group.get_worker_at_index(ix);
-                worker_.flags.kill_self = true;
-                worker_.wakeup();
-                worker_.thread.?.join();
+                @atomicStore(bool, &worker.flags.kill_self, true, AtomicOrder.Monotonic);
+                worker.wakeup();
+                worker.thread.?.join();
             }
             ix += 1;
             if (ix == limit) break;
@@ -978,10 +958,16 @@ comptime {
         @offsetOf(TaskFrame_Subtask, "child_task_count");
     if (!counterOffsetOk2) @compileError("Invalid counter offset");
 }
+const WorkerState = enum {
+    Processing, Sleeping
+};
+const WorkerSignal = enum(u32) {
+    WakeToDie, WakeToWork, Sleeping, None
+};
 
 fn worker_processing_routine(worker: *Worker) void {
 
-    worker.flags.kill_self = false;
+    @atomicStore(bool, &worker.flags.was_started, true, AtomicOrder.Monotonic);
     // const work_group = worker.work_group_ref;
 
     var export_context : WorkerExportData = undefined;
@@ -997,79 +983,93 @@ fn worker_processing_routine(worker: *Worker) void {
         .temp_data = &temp_data
     };
 
-    var curernt_task : Task = undefined;
-    quantum: while (true) {
-        if (export_context.task_set.pop()) |task| curernt_task = task
-        else {
-            // mark as available for consumption
-            const all_idle = worker.advertise_as_available();
-            const outcome = @cmpxchgStrong(
-                u32,
-                &worker.work_group_ref.external_ref_count,
-                0,
-                0,
-                AtomicOrder.Monotonic,
-                AtomicOrder.Monotonic);
-            const no_external_references = outcome == null;
-            const should_dispose_workgroup = all_idle and no_external_references;
-            if (should_dispose_workgroup) {
-                // release any resource
-                const outcome_ = @cmpxchgStrong(
-                    bool,
-                    &worker.work_group_ref.group_destruction_began,
-                    false, true,
-                    AtomicOrder.Monotonic,
-                    AtomicOrder.Monotonic);
-                const already_began = outcome_ != null;
-                if (already_began) return
-                else {
-                    worker.internal_side_dispose();
-                }
-                return;
-            } else {
-                const suicide = worker.hibernate();
-                if (suicide) {
-                    // release resources
-                    return;
-                } else {
-                    continue :quantum;
-                }
-            }
-        }
-        const action_ptr = curernt_task.action_ptr.get();
-        switch (curernt_task.meta0.action_type) {
-            .Then => {
-                const components = curernt_task.get_components();
-                fast_path:while (true) {
-                    var action =
-                        @as(*const fn (*const TaskContext, *anyopaque) Continuation, @ptrCast(action_ptr));
-                    const outcome = action(&task_ctx, components.data_ptr);
-                    // we need to deal with subtasks
-                    switch (outcome.payload) {
-                        .Then => |data| {
-                            action = data.next_operation;
-                            continue :fast_path;
-                        },
-                        .Done => {
-                            switch (curernt_task.meta0.frame_layout) {
-                                .ThreadResumer => {
-                                    const header = @as(*TaskFrame_ResumesThread,@alignCast(@ptrCast(components.header_ptr)));
-                                    header.resume_flag.store(1, AtomicOrder.Monotonic);
-                                    std.Thread.Futex.wake(header.resume_flag, 1);
-                                },
-                                .Standalone => {
+    var current_task : Task = undefined;
+    var state: WorkerState = .Processing;
+    state_dispath:while (true) {
+        switch (state) {
+            .Processing => {
+                quantum: while (true) {
+                    if (export_context.task_set.pop()) |task| current_task = task
+                    else {
+                        state = .Sleeping;
+                        continue :state_dispath;
+                    }
+                    const action_ptr = current_task.action_ptr.get();
+                    switch (current_task.meta0.action_type) {
+                        .Then => {
+                            const components = current_task.get_components();
+                            fast_path:while (true) {
+                                var action =
+                                    @as(*const fn (*const TaskContext, *anyopaque) Continuation, @ptrCast(action_ptr));
+                                const continuation = action(&task_ctx, components.data_ptr);
+                                // we need to deal with subtasks
+                                switch (continuation.payload) {
+                                    .Then => |fun| {
+                                        action = fun.next_operation;
+                                        continue :fast_path;
+                                    },
+                                    .Done => {
+                                        switch (current_task.meta0.frame_layout) {
+                                            .ThreadResumer => {
+                                                const header = @as(*TaskFrame_ResumesThread,@alignCast(@ptrCast(components.header_ptr)));
+                                                header.resume_flag.store(1, AtomicOrder.Monotonic);
+                                                std.Thread.Futex.wake(header.resume_flag, 1);
+                                            },
+                                            .Standalone => {
 
-                                },
-                                .TaskResumer => {
+                                            },
+                                            .TaskResumer => {
 
+                                            }
+                                        }
+                                        continue :quantum;
+                                    }
                                 }
                             }
-                            continue :quantum;
-                        }
+                        },
+                        .Done => unreachable
                     }
                 }
             },
-            .Done => unreachable
+            .Sleeping => {
+                // mark as available for consumption
+                const all_idle = worker.advertise_as_available();
+                const outcome = @cmpxchgStrong(
+                    u32,
+                    &worker.work_group_ref.external_ref_count,
+                    0,
+                    0,
+                    AtomicOrder.Monotonic,
+                    AtomicOrder.Monotonic);
+                const no_external_references = outcome == null;
+                const time_to_shutdown = all_idle and no_external_references;
+                if (time_to_shutdown) {
+                    // there will be at least one external reference always active
+                    // to join threads.
+                    // dont forget to release resources
+                    return;
+                }
+                const signal: u32 = @intFromEnum(WorkerSignal.Sleeping);
+                worker.futex_wake_object.store(signal, AtomicOrder.Release);
+                var signal_ : WorkerSignal = undefined;
+                while (true) {
+                    std.Thread.Futex.wait(&worker.futex_wake_object, signal);
+                    signal_ = @enumFromInt(worker.futex_wake_object.load(.Monotonic));
+                    if (signal_ != .Sleeping) break;
+                }
+                switch (signal_) {
+                    .WakeToWork => {
+                        @fence(AtomicOrder.Acquire);
+                        state = .Processing;
+                        continue :state_dispath;
+                    },
+                    .WakeToDie => {
+                        continue :state_dispath;
+                    },
+                    .Sleeping => unreachable,
+                    .None => unreachable
+                }
+            }
         }
     }
 }
@@ -1162,13 +1162,14 @@ test "ralocing" {
 
 test "wg init" {
     const wg = try WorkGroup.new(std.heap.page_allocator);
+    const text = "ahoy, maties!";
     const T = struct {
-        fn jopa(_: *const TaskContext, capture: *u32) Continuation {
-            std.debug.print("{}", .{capture.*});
+        fn jopa(_: *const TaskContext, capture: *@TypeOf(text)) Continuation {
+            std.testing.expect(capture.* == text) catch @panic("fooo");
+            std.debug.print("{s}", .{capture.*});
             return Continuation { .payload = .Done };
         }
     };
-    try wg.submit_task_and_await(@as(u32,1111), T.jopa);
+    try wg.submit_task_and_await(text, T.jopa);
     wg.done_here();
 }
-
