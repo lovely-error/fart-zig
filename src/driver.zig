@@ -40,7 +40,7 @@ comptime {
         @compileError("That wouldnt fit into a segment count");
 }
 fn GenericPageWMtd(comptime Mtd:type) type {
-    return commons.MemBlock(page_size,page_size, Mtd, u8);
+    return commons.MemBlock(page_size, page_size, Mtd, u8);
 }
 
 
@@ -123,42 +123,17 @@ const SomeFailablePageProvider = struct {
         return self.get_free_page_fn(self.data);
     }
 };
-const SomeInfailablePageProvider = struct {
-    data: *anyopaque,
-    get_free_page_fn: *const fn (*anyopaque) Allocator.Error!*GenericPage,
 
-    fn init(self: *@This(),object_ref:anytype) void {
-        const ti = comptime @typeInfo(@TypeOf(object_ref));
-        // comptime if (!std.meta.trait.isSingleItemPtr(@TypeOf(object_ref))) {
-        //     @compileError("Expected ptr, got " ++ @typeName(@TypeOf(object_ref)));
-        // };
-        const PointeeTy = ti.Pointer.child;
-        // comptime if (!@hasDecl(PointeeTy, "get_field")) {
-        //     const msg = std.fmt.comptimePrint(
-        //         "Pointed object {} does not have member function named 'get_page'", .{@typeName(PointeeTy)});
-        //     @compileError(msg);
-        // };
-        // const mem_fun_ty = @TypeOf(@field(PointeeTy, "get_page"));
-        // comptime if (mem_fun_ty != fn (self:*PointeeTy) *GenericPage) {
-        //     @compileError("Invalid type of member function 'get_page'");
-        // };
-        self.data = @ptrCast(object_ref);
-        self.get_free_page_fn = @ptrCast(&PointeeTy.get_page);
-    }
-    fn get_page(self:*const @This()) Allocator.Error!*GenericPage {
-        return try self.get_free_page_fn(self.data);
-    }
-};
 pub const InfailablePageProvider = struct {
-    infailable_source: SomeInfailablePageProvider,
     failable_sources: []SomeFailablePageProvider,
+    infailable_source: *RootAllocator,
 
-    pub fn get_page(self:*const @This()) *GenericPage {
+    pub fn get_page(self:*const @This()) !*GenericPage {
         for (self.failable_sources) |is| {
             const outcome = is.try_get_page();
-            if (outcome != null) return outcome;
+            if (outcome != null) return outcome.?;
         }
-        const page = self.infailable_source.get_page();
+        const page = try self.infailable_source.get_page();
         return @ptrCast(page);
     }
 };
@@ -193,7 +168,7 @@ pub const RegionAllocator = struct {
         self:*@This(),
         object_size:usize,
         alignment: usize,
-        ralloc:SomeInfailablePageProvider
+        ralloc:*InfailablePageProvider
     ) !OpaqueObjectRef {
         const max_object_size = page_size - @sizeOf(Segment);
         if (object_size > max_object_size) {
@@ -318,7 +293,7 @@ pub const RegionAllocator = struct {
         }
         return true;
     }
-    fn do_initial_setup(self:*@This(), allocer: SomeInfailablePageProvider) !void {
+    fn do_initial_setup(self:*@This(), allocer: *InfailablePageProvider) !void {
         const page = try allocer.get_page();
         const addr = @intFromPtr(page);
         self.page_start.addr = addr;
@@ -351,7 +326,7 @@ pub const RegionAllocator = struct {
         header.next_page = null;
         self.allocation_tail.add_bytes(@sizeOf(RAllocMtd));
     }
-    fn pagein(self:*@This(), palloc:SomeInfailablePageProvider) !void {
+    fn pagein(self:*@This(), palloc:*InfailablePageProvider) !void {
         const new_page = try palloc.get_page();
         const addr = @intFromPtr(new_page);
         self.current_write_page.get().header.next_page = @ptrCast(new_page);
@@ -467,6 +442,9 @@ const OpaqueObjectRef = packed struct {
         const addr = @intFromPtr(ptr_) & ~@as(usize,@sizeOf(GenericPage) - 1);
         return @ptrFromInt(addr);
     }
+    fn bind_to(self:@This(), comptime T:type) ObjectRef(T) {
+        return .{.ptr = self };
+    }
 };
 comptime {
     commons.ensure_exact_byte_size(OpaqueObjectRef, 8);
@@ -478,11 +456,13 @@ fn ObjectRef(comptime T: type) type {
 
         fn get_data_ptr(self: *const @This()) *T {
             const ptr_ = self.ptr.get_data_ptr();
-            return @ptrCast(ptr_);
+            return @alignCast(@ptrCast(ptr_));
         }
     };
 }
-
+comptime {
+    commons.ensure_exact_byte_size(ObjectRef(anyopaque), 8);
+}
 // const WorkGroupCreationFailure = error {
 
 // };
@@ -500,7 +480,8 @@ pub const WorkGroup = struct {
     inline_workers: [16]Worker,
 
     pub fn new(page_source: Allocator) !WorkGroupRef {
-        const cpu_count : u32 = @intCast(@min(16,try std.Thread.getCpuCount())); // todo fixme
+        // const cpu_count : u32 = @intCast(@min(16,try std.Thread.getCpuCount())); // todo fixme
+        const cpu_count = 1;
 
         var host_alloc = page_source;
         var wg : *WorkGroup = @ptrCast(try host_alloc.alloc(WorkGroup, 1));
@@ -597,39 +578,25 @@ pub const WorkGroupRef = struct {
             {
                 const exported = free_worker.exported_worker_local_data.?;
 
-                var page_source : SomeInfailablePageProvider = undefined;
-                page_source.init(&free_worker.work_group_ref.root_allocator);
-
+                const Capture = @TypeOf(capture);
                 var initial_task : Task = undefined;
-                initial_task.set_fun_ptr(@ptrCast(operation));
-                initial_task.meta0.action_type = ActionType.Then;
-                initial_task.meta0.frame_layout = .ThreadResumer;
+                const ptrs = try initial_task.do_pre_init(
+                    @ptrCast(operation),
+                    &exported.region_allocator,
+                    &exported.some_provider,
+                    @alignOf(Capture),
+                    @sizeOf(Capture),
+                    .ThreadResumer);
 
-                const task_frame_align : usize = @alignOf(TaskFrame_ResumesThread);
-                var size : usize = @sizeOf(TaskFrame_ResumesThread);
-                const aligned_for_data = std.mem.alignForward(usize, size, @alignOf(@TypeOf(capture)));
-                const need_overalign = aligned_for_data - size != 0;
-                initial_task.meta0.data_alignment_order =
-                    if (need_overalign) @ctz(aligned_for_data) else 0 ;
-
-                size += @sizeOf(@TypeOf(capture));
-
-                const frame = try exported.region_allocator.alloc_bytes(
-                    size, task_frame_align, page_source);
-                initial_task.frame_ptr = frame;
-
-                var ptr_ : ptr.Ptr(TaskFrame_ResumesThread, true) = undefined;
-                ptr_.set(@alignCast(@ptrCast(frame.get_data_ptr())));
-
-                const frame_header = ptr_.get();
+                const frame_header = @as(
+                    *TaskFrame_ThreadResumer,
+                    @alignCast(@ptrCast(ptrs.header)));
                 frame_header.child_task_count = 0;
                 frame_header.resume_flag = &resume_flag;
 
-                var data_ptr = ptr_;
-                data_ptr.add_bytes(aligned_for_data);
-                data_ptr.rebind_to(@TypeOf(capture)).get().* = capture;
+                @as(*Capture,@alignCast(@ptrCast(ptrs.data))).* = capture;
 
-                _ = exported.task_set.push(initial_task);
+                _ = try exported.task_set.push(initial_task, &exported.some_provider);
             }
             free_worker.end_safe_sync_access();
             free_worker.wakeup();
@@ -662,12 +629,6 @@ pub const WorkGroupRef = struct {
     }
 };
 
-const CrossWorkerTransactionState = enum(u8) {
-    ReadyToRecieve, Finished
-};
-const WorkerInitFlags = enum(u8) {
-    Void, Initing, Done
-};
 pub const Worker = struct {
     work_group_ref: *WorkGroup,
     thread: ?std.Thread,
@@ -722,30 +683,6 @@ pub const Worker = struct {
         self.futex_wake_object.store(
             @intFromEnum(WorkerSignal.WakeToWork), AtomicOrder.Release);
     }
-    // true if should suicide
-    pub fn hibernate(self:*@This()) bool {
-        while (true) {
-            const outcome = @cmpxchgStrong(
-                CrossWorkerTransactionState,
-                &self.flags.transaction_state,
-                .Finished,
-                .ReadyToRecieve,
-                AtomicOrder.AcqRel,
-                AtomicOrder.Monotonic);
-            if (outcome == null) return false;
-            // its good idead to perform mem defrag here
-            const signal = @cmpxchgWeak(
-                OperationState,
-                &self.work_group_ref.operation_state,
-                .ShutdownStarted,
-                .ShutdownStarted,
-                AtomicOrder.Monotonic,
-                AtomicOrder.Monotonic);
-
-            if (signal == (1 << 32) - 1) return true;
-            std.Thread.Futex.wait(&self.futex_wake_object, 0);
-        }
-    }
     pub fn wakeup(self:*const @This()) void {
         std.Thread.Futex.wake(&self.futex_wake_object, 1);
     }
@@ -761,116 +698,23 @@ pub const Worker = struct {
         const all_idle = prior_occupation_map | mask == self.work_group_ref.all_idle_mask;
         return all_idle;
     }
-    pub fn internal_side_dispose(self:*@This()) void {
-        var ix:u32 = 0;
-        const work_group = self.work_group_ref;
-        const limit = work_group.worker_count;
-        while (true) {
-            if (ix == self.worker_index) { ix += 1; continue; }
-            const worker = self.work_group_ref.get_worker_at_index(ix);
-            const outcome = @cmpxchgStrong(
-                bool,
-                &worker.flags.was_started,
-                true,
-                true,
-                AtomicOrder.Monotonic, AtomicOrder.Monotonic);
-            const was_started = outcome == null;
-            if (was_started) {
-                @atomicStore(bool, &worker.flags.kill_self, true, AtomicOrder.Monotonic);
-                worker.wakeup();
-                worker.thread.?.join();
-            }
-            ix += 1;
-            if (ix == limit) break;
-        }
-    }
 };
 const TaskPack = @Vector(16, u128);
-const CombinerPageMtd = packed struct {
-    occupation_map: u64, // 0 taken, 1 available
-    next_page: ?*anyopaque,
-};
-const CombinerPage = GenericPageWMtd(CombinerPageMtd);
-const Combiner = struct {
-    page_start: ptr.Ptr(CombinerPage, true),
-    current_write_page: ptr.Ptr(CombinerPage, true),
-    current_segment_read_ptr: ptr.Ptr(TaskPack, true),
-    current_segment_write_ptr: ptr.Ptr(TaskPack, true),
 
-    fn init(self:*@This()) void {
-        self.page_start.set_null();
-        self.current_write_page.set_null();
-        self.current_segment_read_ptr.set_null();
-        self.current_segment_write_ptr.set_null();
-    }
-    fn do_first_init(self:*@This(), allocer:*InfailablePageProvider) void {
-        const page : *CombinerPage = @ptrCast(try allocer.get_page());
-        page.header.next_page.set_null();
-        const map = (1 << (@sizeOf(GenericPage) / @sizeOf(Segment))) - 1;
-        @atomicStore(u64, &page.header.occupation_map, map, AtomicOrder.Monotonic);
-        self.page_start.set(page);
-        self.current_write_page.set(page);
-        self.current_segment_read_ptr.addr = @intFromPtr(page);
-        self.current_segment_read_ptr.advance(1);
-        self.current_segment_write_ptr.addr = @intFromPtr(page);
-        self.current_segment_write_ptr.advance(1);
-    }
-    fn pagein(self:*@This(), allocator:*InfailablePageProvider) !void {
-        const page = try allocator.get_page();
-        self.page_start.addr = @intFromPtr(page);
-        @atomicStore(
-            u16,
-            &self.current_write_page.get().header.ref_count,
-            1,
-            AtomicOrder.Monotonic);
-        self.segment_ptr.addr = @intFromPtr(page);
-        self.segment_ptr.advance(1);
-    }
-    // true if object in left in uninit state
-    fn release_page(self:*@This()) void {
-        const val = @atomicRmw(
-            u16,
-            &self.page_start.get().header.ref_count,
-            AtomicRmwOp.Sub,
-            1,
-            AtomicOrder.Monotonic);
-        if (val == 1) {
-            @fence(AtomicOrder.Acquire);
-            @atomicStore(
-                u16,
-                &self.page_start.get().header.ref_count,
-                1,
-                AtomicOrder.Monotonic);
-            self.segment_ptr.addr = self.page_start.addr;
-            self.segment_ptr.advance(1);
-        } else {
-            self.page_start.set_null();
-        }
-    }
-    fn get_storage_for_pack(
-        self:*@This(),
-        allocator:*InfailablePageProvider
-    ) ptr.Ptr(TaskPack, true) {
-        if (self.page_start.is_null()) try self.pagein(allocator);
-        const task_pack_addr = self.segment_ptr.addr;
-        _ = @atomicRmw(
-            u16,
-            &self.page_start.get().header.ref_count,
-            AtomicRmwOp.Add,
-            1,
-            AtomicOrder.Monotonic);
-        const next_pack_addr = task_pack_addr + @sizeOf(TaskPack);
-        const at_the_boundry = next_pack_addr == self.page_start.addr + page_size;
-        if (at_the_boundry) self.release_page();
-        var ptr_ : ptr.Ptr(TaskPack, true) = undefined;
-        ptr_.addr = task_pack_addr;
-        return ptr_;
-    }
-};
 const TaskPackPtr = packed struct {
     ptr: ptr.CompressedPtr(TaskPack, ptr.@"Byte amount fitting within 48 bit address space", true),
     item_count: u16,
 
+    fn set_arr(
+        self:*@This(),
+        ptr_ : *[16]Task,
+        item_count: u16
+    ) void {
+        var ptr__ : @TypeOf(self.ptr)= undefined;
+        ptr__.set(@alignCast(@ptrCast(ptr_)));
+        self.ptr = ptr__;
+        self.item_count = item_count;
+    }
     fn set_null(self:*@This()) void {
         var ptr_ : @TypeOf(self.ptr) = undefined;
         ptr_.set_null();
@@ -878,7 +722,7 @@ const TaskPackPtr = packed struct {
         self.item_count = 0;
     }
     fn is_null(self:*const @This()) bool {
-        return @as(u64,@bitCast(self.*)) == 0;
+        return self.ptr.is_null();
     }
     fn get_mtd_ref(self:*const @This()) *u16 {
         const addr = @as(usize,self.ptr.address) & ~(@alignOf(GenericPage) - 1);
@@ -893,25 +737,161 @@ const TaskPackPtr = packed struct {
 comptime {
     commons.ensure_exact_byte_size(TaskPackPtr, 8);
 }
-const TaskSet = struct {
-    inline_tasks: commons.InlineQueue(Task, 16, @alignOf(TaskPack)),
-    paging_storage_start: Combiner,
+const OutlinerMtd = packed struct {
+    occupation_map: u64, // 0 taken , 1 free
+    next_page: ?*anyopaque
+};
+const OutlinerPage = GenericPageWMtd(OutlinerMtd);
+comptime {
+    if(@alignOf(OutlinerPage) != @alignOf(GenericPage)) {
+        // @compileLog("Incorrect alignment");
+    }
+}
+const Outliner = struct {
+    first_page: ptr.Ptr(OutlinerPage, true),
+    current_page: ptr.Ptr(OutlinerPage, true),
+    write_head: ptr.Ptr(TaskPack, true),
 
     fn init(self:*@This()) void {
-        self.inline_tasks.init();
+        self.first_page.set_null();
+        self.current_page.set_null();
+        self.current_page.set_null();
     }
-    fn push(self:*@This(), task: Task) bool {
-        return self.inline_tasks.push_to_tail(task);
+    fn all_free_map() u64 {
+        return ((@as(u64,1) << @intCast(@sizeOf(GenericPage) / @sizeOf(TaskPack))) - 1) ^ 1;
+    }
+    fn do_first_init(self:*@This(), page_provider: *InfailablePageProvider) !void {
+        const page = try page_provider.get_page();
+        const addr = @intFromPtr(page);
+        self.current_page.addr = addr;
+        self.first_page.addr = addr;
+        self.write_head.addr = self.current_page.addr + @sizeOf(TaskPack);
+
+        const header = &self.first_page.get().header;
+        header.next_page = null;
+        const map: u64 = @This().all_free_map();
+        @atomicStore(
+            u64,
+            &header.occupation_map,
+            map,
+            AtomicOrder.Monotonic);
+    }
+    fn switch_page(self:*@This(), page_provider:*InfailablePageProvider) !void {
+        const page: *OutlinerPage = @alignCast(@ptrCast(try page_provider.get_page()));
+        self.current_page.get().header.next_page = page;
+        const header = &page.header;
+        header.next_page = null;
+        const map: u64 = @This().all_free_map();
+        @atomicStore(
+            u64,
+            &header.occupation_map,
+            map,
+            AtomicOrder.Monotonic);
+        self.current_page.set(page);
+        self.write_head.addr = self.current_page.addr + @sizeOf(TaskPack);
+    }
+    fn find_free_space(self:*@This(), page_provider: *InfailablePageProvider) !*[16]Task {
+        if (self.first_page.is_null()) {
+            try self.do_first_init(page_provider);
+        }
+        var page = self.first_page;
+        while (true) {
+            var header = page.get().header;
+            const map = @atomicLoad(
+                u64,
+                &header.occupation_map,
+                AtomicOrder.Monotonic);
+            const free_index = @ctz(map);
+            const no_space = free_index == 64;
+            if (no_space) {
+                if (header.next_page == null) {
+                    try self.switch_page(page_provider);
+                    page = self.current_page;
+                    continue;
+                } else {
+                    page.set(@alignCast(@ptrCast(header.next_page.?)));
+                    continue;
+                }
+            } else {
+                const index = (self.write_head.addr - self.current_page.addr) / @sizeOf(TaskPack);
+                const mask = ~(@as(u64,1) << @intCast(index));
+                _ = @atomicRmw(
+                    u64,
+                    &self.current_page.get().header.occupation_map,
+                    AtomicRmwOp.And,
+                    mask,
+                    AtomicOrder.Monotonic);
+                var space = self.current_page.rebind_to(TaskPack);
+                space.advance(index);
+                return @ptrCast(space.get());
+            }
+        }
+    }
+};
+const OutlineTasks = std.ArrayList(TaskPackPtr);
+const TaskSet = struct {
+    inline_tasks: commons.InlineQueue(Task, 16, @alignOf(TaskPack)),
+    outline_tasks: OutlineTasks,
+    outline_storage: Outliner,
+    pack_ptr: ?*[16]Task,
+    current_subindex: u16,
+
+    fn init(self:*@This()) !void {
+        self.inline_tasks.init();
+        self.outline_tasks = try OutlineTasks.initCapacity(std.heap.page_allocator, 16);
+        self.current_subindex = 0;
+        self.pack_ptr = null;
+    }
+    // true if failed
+    fn push(self:*@This(), task: Task, page_provider:*InfailablePageProvider) !void {
+        const failed = self.inline_tasks.push_to_tail(task);
+        if (failed) {
+            if (self.pack_ptr == null) {
+                self.pack_ptr = try self.outline_storage.find_free_space(page_provider);
+            }
+            self.pack_ptr.?[self.current_subindex] = task;
+            const si = self.current_subindex + 1;
+            if (si == 16) {
+                var ptr_ : TaskPackPtr = undefined;
+                ptr_.set_arr(self.pack_ptr.?, si);
+                (try self.outline_tasks.addOne()).* = ptr_;
+                self.pack_ptr = null;
+                self.current_subindex = 0;
+            } else {
+                self.current_subindex = si;
+            }
+        }
     }
     fn pop(self:*@This()) ?Task {
         return self.inline_tasks.pop_from_head();
     }
+    fn finish(self:*@This()) !void {
+        if (self.pack_ptr != null) {
+            var ptr_ : TaskPackPtr = undefined;
+            ptr_.set_arr(self.pack_ptr.?, self.current_subindex);
+            (try self.outline_tasks.addOne()).* = ptr_;
+            self.pack_ptr = null;
+            self.current_subindex = 0;
+        }
+    }
 } ;
 const TempData = struct {
     subtask_count: usize = 0,
+    parked_task: ?ObjectRef(Task),
+    first_run: bool,
 
     fn did_spawn_any_subtasks(self:*const @This()) bool {
         return self.subtask_count != 0;
+    }
+    fn reset(self:*@This()) void {
+        self.subtask_count = 0;
+        self.parked_task = null;
+        self.first_run = true;
+    }
+    fn init_defaults(self:*@This()) void {
+        self.first_run = true;
+        self.parked_task = null;
+        self.subtask_count = 0;
     }
 };
 pub const TaskContext = struct {
@@ -922,44 +902,77 @@ pub const TaskContext = struct {
         self: *const @This(),
         capture: anytype,
         operation: *const fn(*const TaskContext, *@TypeOf(capture)) Continuation
-    ) void {
-        _ = self;
-        _ = operation;
+    ) !void {
+        try self.do_idempotent_park();
+        self.temp_data.subtask_count += 1;
 
+        const Capture = @TypeOf(capture);
+        var subtask: Task = undefined;
+        const ptrs = try subtask.do_pre_init(
+            @ptrCast(operation),
+            &self.export_data.region_allocator,
+            &self.export_data.some_provider,
+            @alignOf(Capture),
+            @sizeOf(Capture),
+            .TaskResumer);
+        @as(*Capture,@alignCast(@ptrCast(ptrs.data))).* = capture;
+        const header = @as(
+            *TaskFrame_TaskResumer,
+            @alignCast(@ptrCast(ptrs.header)));
+        header.child_task_count = 0;
+        header.resumption_task_lot = self.temp_data.parked_task.?;
+
+        try self.export_data.task_set.push(subtask, &self.export_data.some_provider);
+    }
+    fn do_idempotent_park(self:*const @This()) !void {
+        if (!self.temp_data.first_run) return;
+        if (self.temp_data.parked_task == null) {
+            const ptr_ = try self.export_data.region_allocator.alloc_bytes(
+                @sizeOf(Task), @alignOf(Task), &self.export_data.some_provider);
+            const slot = ptr_.bind_to(Task);
+            self.temp_data.parked_task = slot;
+        }
+        self.temp_data.first_run = false;
     }
 };
 pub const WorkerExportData = struct {
     region_allocator: RegionAllocator,
+    some_provider: InfailablePageProvider,
     task_set: TaskSet,
 };
 
 const ActionType = enum {
     Then, Done
 };
-
+const FrameType = enum {
+    Standalone, ThreadResumer, TaskResumer
+};
+const TaskFrame_CounterView = packed struct {
+    child_task_count: u64
+};
 const TaskFrame_Standalone = packed struct {
     child_task_count: u64
 };
-const TaskFrame_ResumesThread = packed struct {
+const TaskFrame_ThreadResumer = packed struct {
     child_task_count: u64,
     resume_flag: *atomic.Atomic(u32),
 };
-const TaskFrame_Subtask = packed struct {
+const TaskFrame_TaskResumer = packed struct {
     child_task_count: u64,
     resumption_task_lot: ObjectRef(Task)
 };
 comptime {
     const counterOffsetOk1 =
         @offsetOf(TaskFrame_Standalone, "child_task_count") ==
-        @offsetOf(TaskFrame_ResumesThread, "child_task_count");
+        @offsetOf(TaskFrame_ThreadResumer, "child_task_count");
     if (!counterOffsetOk1) @compileError("Invalid counter offset");
     const counterOffsetOk2 =
         @offsetOf(TaskFrame_Standalone, "child_task_count") ==
-        @offsetOf(TaskFrame_Subtask, "child_task_count");
+        @offsetOf(TaskFrame_TaskResumer, "child_task_count");
     if (!counterOffsetOk2) @compileError("Invalid counter offset");
 }
 const WorkerState = enum {
-    Processing, Sleeping
+    Processing, Sleeping, WorkFinding
 };
 const WorkerSignal = enum(u32) {
     WakeToDie, WakeToWork, Sleeping, None
@@ -974,9 +987,15 @@ fn worker_processing_routine(worker: *Worker) void {
     worker.exported_worker_local_data = &export_context;
 
     export_context.region_allocator.init();
-    export_context.task_set.init();
+    export_context.task_set.init() catch @panic("failed init");
 
-    var temp_data : TempData = .{};
+    export_context.some_provider = .{
+        .failable_sources = &[_]SomeFailablePageProvider{},
+        .infailable_source = &worker.work_group_ref.root_allocator
+    };
+
+    var temp_data : TempData = undefined;
+    temp_data.init_defaults();
 
     const task_ctx : TaskContext = . {
         .export_data = &export_context,
@@ -984,55 +1003,110 @@ fn worker_processing_routine(worker: *Worker) void {
     };
 
     var current_task : Task = undefined;
-    var state: WorkerState = .Processing;
+    var state: WorkerState = .Sleeping;
     state_dispath:while (true) {
         switch (state) {
+            .WorkFinding => {
+                if (export_context.task_set.pop()) |task| {
+                    current_task = task;
+                    state = .Processing;
+                    continue :state_dispath;
+                }
+
+                state = .Sleeping;
+                continue :state_dispath;
+            },
             .Processing => {
-                quantum: while (true) {
-                    if (export_context.task_set.pop()) |task| current_task = task
-                    else {
-                        state = .Sleeping;
-                        continue :state_dispath;
-                    }
-                    const action_ptr = current_task.action_ptr.get();
-                    switch (current_task.meta0.action_type) {
-                        .Then => {
-                            const components = current_task.get_components();
-                            fast_path:while (true) {
-                                var action =
-                                    @as(*const fn (*const TaskContext, *anyopaque) Continuation, @ptrCast(action_ptr));
-                                const continuation = action(&task_ctx, components.data_ptr);
-                                // we need to deal with subtasks
-                                switch (continuation.payload) {
-                                    .Then => |fun| {
-                                        action = fun.next_operation;
-                                        continue :fast_path;
-                                    },
-                                    .Done => {
-                                        switch (current_task.meta0.frame_layout) {
-                                            .ThreadResumer => {
-                                                const header = @as(*TaskFrame_ResumesThread,@alignCast(@ptrCast(components.header_ptr)));
-                                                header.resume_flag.store(1, AtomicOrder.Monotonic);
-                                                std.Thread.Futex.wake(header.resume_flag, 1);
-                                            },
-                                            .Standalone => {
-
-                                            },
-                                            .TaskResumer => {
-
+                const cont = current_task.load_continuation();
+                const components = current_task.get_components();
+                switch (cont.payload) {
+                    .Then => |cont_| {
+                        var action = @as(
+                            *const fn (*const TaskContext, *anyopaque) Continuation,
+                            @ptrCast(cont_.next_operation));
+                        const continuation = action(&task_ctx, components.data_ptr);
+                        current_task.store_continuation(continuation);
+                        const subtask_count = temp_data.subtask_count;
+                        if (subtask_count != 0) {
+                            temp_data.parked_task.?.get_data_ptr().* = current_task;
+                            const header = @as(
+                                *TaskFrame_CounterView,
+                                @alignCast(@ptrCast(components.header_ptr)));
+                            @atomicStore(
+                                u64,
+                                &header.child_task_count,
+                                subtask_count,
+                                AtomicOrder.Monotonic);
+                            export_context.task_set.finish() catch @panic("oops");
+                            const overfilled =
+                                export_context.task_set.outline_tasks.items.len != 0;
+                            if (overfilled) {
+                                while (true) {
+                                    const mix = worker.work_group_ref.try_find_unoccupied_index();
+                                    if (mix) |ix| {
+                                        const mitem = export_context.task_set.outline_tasks.popOrNull();
+                                        if (mitem) |item| {
+                                            const free_worker = worker.work_group_ref.get_worker_at_index(ix);
+                                            free_worker.start() catch @panic("fix me");
+                                            free_worker.begin_safe_sync_access();
+                                            {
+                                                free_worker.shared_task_pack = item;
                                             }
-                                        }
-                                        continue :quantum;
-                                    }
+                                            free_worker.end_safe_sync_access();
+                                            free_worker.wakeup();
+                                        }else { break; }
+                                    } else {break;}
                                 }
                             }
-                        },
-                        .Done => unreachable
+                            temp_data.reset();
+                            state = .WorkFinding;
+                        }
+                        continue :state_dispath;
+                    },
+                    .Done => {
+                        switch (current_task.meta0.frame_layout) {
+                            .ThreadResumer => {
+                                const header = @as(
+                                    *TaskFrame_ThreadResumer,
+                                    @alignCast(@ptrCast(components.header_ptr)));
+                                header.resume_flag.store(1, AtomicOrder.Monotonic);
+                                std.Thread.Futex.wake(header.resume_flag, 1);
+                                // release this task frame
+                            },
+                            .Standalone => {
+                                @panic("todo");
+                            },
+                            .TaskResumer => {
+                                const header = @as(
+                                    *TaskFrame_TaskResumer,
+                                    @alignCast(@ptrCast(components.header_ptr)));
+                                const parent = header.resumption_task_lot.get_data_ptr();
+                                const prior = @atomicRmw(
+                                    u64,
+                                    parent.get_counter_ptr(),
+                                    AtomicRmwOp.Sub,
+                                    1,
+                                    AtomicOrder.Release);
+                                const last = prior == 1;
+                                if (last) {
+                                    @fence(AtomicOrder.Acquire);
+                                    const next_task = parent.*;
+                                    // release park slot
+                                    // release current task frame.
+                                    current_task = next_task;
+                                    state = .Processing;
+                                    continue :state_dispath;
+                                } else {
+                                    // dispose frame of self
+                                }
+                            }
+                        }
+                        state = .WorkFinding;
+                        continue :state_dispath;
                     }
                 }
             },
             .Sleeping => {
-                // mark as available for consumption
                 const all_idle = worker.advertise_as_available();
                 const outcome = @cmpxchgStrong(
                     u32,
@@ -1060,10 +1134,11 @@ fn worker_processing_routine(worker: *Worker) void {
                 switch (signal_) {
                     .WakeToWork => {
                         @fence(AtomicOrder.Acquire);
-                        state = .Processing;
+                        state = .WorkFinding;
                         continue :state_dispath;
                     },
                     .WakeToDie => {
+                        // this is basically goto to redo logic of this state
                         continue :state_dispath;
                     },
                     .Sleeping => unreachable,
@@ -1081,6 +1156,47 @@ pub const Continuation = struct {
         },
         Done
     },
+
+    fn then(opeartion: anytype) @This() {
+        const OpTy = @TypeOf(opeartion);
+        comptime {
+            if (!std.meta.trait.isSingleItemPtr(OpTy)) {
+                @compileError("Expected function pointer, got " ++ @typeName(OpTy));
+            }
+        }
+        comptime {
+            const ti = @typeInfo(@typeInfo(OpTy).Pointer.child);
+            switch (ti) {
+                .Fn => |fun| {
+                    if ((fun.return_type == null) or (fun.return_type.? != Continuation)) {
+                        @compileError("Function has to return Continuation");
+                    }
+                    if (fun.params.len != 2) {
+                        @compileError("Function has to take immutable pointer to TaskContext and pointer to capture");
+                    }
+                    if (fun.params[0].type.? != *const TaskContext) {
+                        @compileError("First parameter have to be *const TaskContext");
+                    }
+                    if (!std.meta.trait.isSingleItemPtr(fun.params[1].type.?)) {
+                        @compileError("Second parameter have to be pointer to captured data");
+                    }
+                },
+                else => {
+                    @compileError("Expected function pointer, got " ++ @typeName(OpTy));
+                }
+            }
+        }
+        const opaque_fun:
+            *const fn (*const TaskContext, *anyopaque) Continuation = @ptrCast(opeartion);
+        var this : @This() = undefined;
+        this.payload = .{ .Then = .{.next_operation = opaque_fun} };
+        return this;
+    }
+    fn done() @This() {
+        var this : @This() = undefined;
+        this.payload = .Done;
+        return this;
+    }
 };
 const Task = packed struct {
     action_ptr: ptr.CompressedPtr(
@@ -1089,7 +1205,7 @@ const Task = packed struct {
         false),
     meta0: packed struct(u16) {
         data_alignment_order: u8,
-        frame_layout: enum { Standalone, ThreadResumer, TaskResumer },
+        frame_layout: FrameType,
         action_type: ActionType,
         _pad1: u5
     },
@@ -1103,6 +1219,9 @@ const Task = packed struct {
         ptr_.set(@ptrCast(fptr));
         self.action_ptr = ptr_;
     }
+    fn get_counter_ptr(self:@This()) *u64 {
+        return @as(*u64,@alignCast(@ptrCast(self.frame_ptr.get_data_ptr())));
+    }
     fn get_components(self:@This()) struct {
         header_ptr: *anyopaque,
         data_ptr: *anyopaque
@@ -1110,8 +1229,8 @@ const Task = packed struct {
         const frame_addr = @intFromPtr(self.frame_ptr.get_data_ptr());
         const header_size:usize = switch (self.meta0.frame_layout) {
             .Standalone => @sizeOf(TaskFrame_Standalone),
-            .ThreadResumer => @sizeOf(TaskFrame_ResumesThread),
-            .TaskResumer => @sizeOf(TaskFrame_Subtask)
+            .ThreadResumer => @sizeOf(TaskFrame_ThreadResumer),
+            .TaskResumer => @sizeOf(TaskFrame_TaskResumer)
         };
         const past_header_addr = frame_addr + header_size;
         const align_order = self.meta0.data_alignment_order;
@@ -1121,7 +1240,69 @@ const Task = packed struct {
                 usize, past_header_addr, @as(usize,1) << @intCast(align_order));
         return .{.header_ptr = @ptrFromInt(frame_addr), .data_ptr = @ptrFromInt(data_addr) };
     }
+    fn do_pre_init(
+        self:*@This(),
+        operation: *const fn (*TaskContext, *anyopaque) Continuation,
+        frame_allocator: *RegionAllocator,
+        page_provider: *InfailablePageProvider,
+        capture_align: usize,
+        capture_size:usize,
+        frame_type: FrameType
+    ) !struct { header: *anyopaque, data: *anyopaque } {
+        self.set_fun_ptr(@ptrCast(operation));
+        self.meta0.action_type = ActionType.Then;
+        self.meta0.frame_layout = frame_type;
 
+        const task_frame_align : usize = switch (frame_type) {
+            .Standalone => @alignOf(TaskFrame_Standalone),
+            .ThreadResumer => @alignOf(TaskFrame_ThreadResumer),
+            .TaskResumer => @alignOf(TaskFrame_TaskResumer)
+        };
+        var size : usize = switch (frame_type) {
+            .Standalone => @sizeOf(TaskFrame_Standalone),
+            .ThreadResumer => @sizeOf(TaskFrame_ThreadResumer),
+            .TaskResumer => @sizeOf(TaskFrame_TaskResumer)
+        };
+        const aligned_for_data = std.mem.alignForward(usize, size, capture_align);
+        const need_overalign = aligned_for_data - size != 0;
+        self.meta0.data_alignment_order =
+            if (need_overalign) @ctz(aligned_for_data) else 0 ;
+
+        size += capture_size;
+
+        const frame = try frame_allocator.alloc_bytes(size, task_frame_align, page_provider);
+        self.frame_ptr = frame;
+
+        const header_ptr: *anyopaque = frame.get_data_ptr();
+        const data_ptr: *anyopaque = @ptrFromInt(@intFromPtr(header_ptr) + aligned_for_data);
+        return .{ .header = header_ptr, .data = data_ptr };
+    }
+    fn store_continuation(self:*@This(), continuation: Continuation) void {
+        switch (continuation.payload) {
+            .Then => |next| {
+                self.meta0.action_type = .Then;
+                self.set_fun_ptr(next.next_operation);
+            },
+            .Done => {
+                self.meta0.action_type = .Done;
+            }
+        }
+    }
+    fn load_continuation(self:*@This()) Continuation {
+        var cont : Continuation = undefined;
+        switch (self.meta0.action_type) {
+            .Then => {
+                const fun = @as(
+                    *const fn (*const TaskContext, *anyopaque) Continuation,
+                    @ptrCast(self.action_ptr.get()));
+                cont.payload = .{ .Then = .{.next_operation = fun } };
+            },
+            .Done => {
+                cont.payload = .Done;
+            }
+        }
+        return cont;
+    }
 };
 comptime {
     commons.ensure_exact_byte_size(Task, 16);
@@ -1137,9 +1318,9 @@ test "ralocing" {
     var sralloc : RegionAllocator = undefined;
     sralloc.init();
 
-    const hui = SomeInfailablePageProvider {
-        .data = &ralloc,
-        .get_free_page_fn = @ptrCast(&RootAllocator.get_page)
+    const hui = InfailablePageProvider {
+        .failable_sources = .{},
+        .infailable_source = &ralloc
     };
 
     const Item = u32;
@@ -1164,12 +1345,40 @@ test "wg init" {
     const wg = try WorkGroup.new(std.heap.page_allocator);
     const text = "ahoy, maties!";
     const T = struct {
-        fn jopa(_: *const TaskContext, capture: *@TypeOf(text)) Continuation {
+        fn run(_: *const TaskContext, capture: *@TypeOf(text)) Continuation {
             std.testing.expect(capture.* == text) catch @panic("fooo");
-            std.debug.print("{s}", .{capture.*});
+            // std.debug.print("{s}", .{capture.*});
             return Continuation { .payload = .Done };
         }
     };
-    try wg.submit_task_and_await(text, T.jopa);
+    try wg.submit_task_and_await(text, T.run);
+    wg.done_here();
+}
+
+test "wg subtasking" {
+    const wg = try WorkGroup.new(std.heap.page_allocator);
+    const Ty = [2]u32;
+    const T = struct {
+        fn run(ctx: *const TaskContext, fooo: **Ty) Continuation {
+            for (fooo.*) |*item| {
+                ctx.spawn_subtask(item,subtask) catch unreachable;
+            }
+            return Continuation.then(&finish);
+        }
+        fn subtask(_:*const TaskContext, data:**u32) Continuation {
+            data.*.* = @as(u32,1);
+            return Continuation.done();
+        }
+        fn finish(_:*const TaskContext, data: **Ty) Continuation {
+            const data_: Ty = data.*.*;
+            const data__ = Ty {1,1};
+            const same = std.mem.eql(u32, &data_, &data__);
+            std.testing.expect(same) catch @panic("oops");
+            // std.debug.print("{any}", .{data_});
+            return Continuation.done();
+        }
+    };
+    var vals = Ty {0,0};
+    try wg.submit_task_and_await(&vals, T.run);
     wg.done_here();
 }
