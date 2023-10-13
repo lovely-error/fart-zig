@@ -241,7 +241,7 @@ pub const RegionAllocator = struct {
                 const fits_in_remaining_space = tail_alloc_addr <= page_boundry_addr;
                 if (fits_in_remaining_space) {
                     var ref : OpaqueObjectRef = undefined;
-                    ref.tag = .MultisegmentRef;
+                    ref.tag = .MultiSegmentRef;
                     var ptr_ : @TypeOf(ref.payload.multi.ptr) = undefined;
                     ptr_.set(@ptrFromInt(alloc_start_addr));
                     ref.payload.multi.ptr = ptr_;
@@ -270,6 +270,18 @@ pub const RegionAllocator = struct {
             }
         }
     }
+    // fn dealloc_bytes(self:*@This(), ref: OpaqueObjectRef) void {
+    //     switch (ref.tag) {
+    //         .MultiSegmentRef => {
+    //             const t = ref.payload.multi;
+    //             @panic("todo");
+    //         },
+    //         .SingleItemRef => {
+    //             const t = ref.payload.single;
+    //             @panic("todo");
+    //         }
+    //     }
+    // }
     fn is_dangling(self:*const @This()) bool {
         return self.current_sub_block.addr == self.current_write_page.addr + page_size;
     }
@@ -425,7 +437,7 @@ const OpaqueObjectRef = packed struct {
             segment_count: u15
         }
     },
-    tag: enum { SingleItemRef, MultisegmentRef },
+    tag: enum { SingleItemRef, MultiSegmentRef },
 
     fn get_data_ptr(self: *const @This()) *anyopaque {
         const ptr_ = self.payload.single;
@@ -877,20 +889,15 @@ const TaskSet = struct {
 } ;
 const TempData = struct {
     subtask_count: usize = 0,
-    parked_task: ?ObjectRef(Task),
-    first_run: bool,
+    current_task: *Task,
 
     fn did_spawn_any_subtasks(self:*const @This()) bool {
         return self.subtask_count != 0;
     }
     fn reset(self:*@This()) void {
         self.subtask_count = 0;
-        self.parked_task = null;
-        self.first_run = true;
     }
     fn init_defaults(self:*@This()) void {
-        self.first_run = true;
-        self.parked_task = null;
         self.subtask_count = 0;
     }
 };
@@ -903,7 +910,6 @@ pub const TaskContext = struct {
         capture: anytype,
         operation: *const fn(*const TaskContext, *@TypeOf(capture)) Continuation
     ) !void {
-        try self.do_idempotent_park();
         self.temp_data.subtask_count += 1;
 
         const Capture = @TypeOf(capture);
@@ -919,20 +925,10 @@ pub const TaskContext = struct {
         const header = @as(
             *TaskFrame_TaskResumer,
             @alignCast(@ptrCast(ptrs.header)));
-        header.child_task_count = 0;
-        header.resumption_task_lot = self.temp_data.parked_task.?;
+        header.parent_task_frame = self.temp_data.current_task.frame_ptr;
+        @atomicStore(u64, &header.child_task_count, 0, .Monotonic);
 
         try self.export_data.task_set.push(subtask, &self.export_data.some_provider);
-    }
-    fn do_idempotent_park(self:*const @This()) !void {
-        if (!self.temp_data.first_run) return;
-        if (self.temp_data.parked_task == null) {
-            const ptr_ = try self.export_data.region_allocator.alloc_bytes(
-                @sizeOf(Task), @alignOf(Task), &self.export_data.some_provider);
-            const slot = ptr_.bind_to(Task);
-            self.temp_data.parked_task = slot;
-        }
-        self.temp_data.first_run = false;
     }
 };
 pub const WorkerExportData = struct {
@@ -947,19 +943,23 @@ const ActionType = enum {
 const FrameType = enum {
     Standalone, ThreadResumer, TaskResumer
 };
-const TaskFrame_CounterView = packed struct {
-    child_task_count: u64
+const TaskFrame_CombinedView = packed struct {
+    child_task_count: u64,
+    park_task_metadata: TaskMetadata
 };
 const TaskFrame_Standalone = packed struct {
-    child_task_count: u64
+    child_task_count: u64,
+    park_data: TaskMetadata
 };
 const TaskFrame_ThreadResumer = packed struct {
     child_task_count: u64,
+    park_data: TaskMetadata,
     resume_flag: *atomic.Atomic(u32),
 };
 const TaskFrame_TaskResumer = packed struct {
     child_task_count: u64,
-    resumption_task_lot: ObjectRef(Task)
+    park_data: TaskMetadata,
+    parent_task_frame: OpaqueObjectRef,
 };
 comptime {
     const counterOffsetOk1 =
@@ -1003,6 +1003,7 @@ fn worker_processing_routine(worker: *Worker) void {
     };
 
     var current_task : Task = undefined;
+    temp_data.current_task = &current_task;
     var state: WorkerState = .Sleeping;
     state_dispath:while (true) {
         switch (state) {
@@ -1028,15 +1029,15 @@ fn worker_processing_routine(worker: *Worker) void {
                         current_task.store_continuation(continuation);
                         const subtask_count = temp_data.subtask_count;
                         if (subtask_count != 0) {
-                            temp_data.parked_task.?.get_data_ptr().* = current_task;
                             const header = @as(
-                                *TaskFrame_CounterView,
+                                *TaskFrame_CombinedView,
                                 @alignCast(@ptrCast(components.header_ptr)));
                             @atomicStore(
                                 u64,
                                 &header.child_task_count,
                                 subtask_count,
                                 AtomicOrder.Monotonic);
+                            header.park_task_metadata = current_task.metadata;
                             export_context.task_set.finish() catch @panic("oops");
                             const overfilled =
                                 export_context.task_set.outline_tasks.items.len != 0;
@@ -1064,7 +1065,7 @@ fn worker_processing_routine(worker: *Worker) void {
                         continue :state_dispath;
                     },
                     .Done => {
-                        switch (current_task.meta0.frame_layout) {
+                        switch (current_task.metadata.frame_layout) {
                             .ThreadResumer => {
                                 const header = @as(
                                     *TaskFrame_ThreadResumer,
@@ -1077,23 +1078,24 @@ fn worker_processing_routine(worker: *Worker) void {
                                 @panic("todo");
                             },
                             .TaskResumer => {
-                                const header = @as(
+                                const current_task_header = @as(
                                     *TaskFrame_TaskResumer,
                                     @alignCast(@ptrCast(components.header_ptr)));
-                                const parent = header.resumption_task_lot.get_data_ptr();
+                                const parent_task_frame_ptr =
+                                     current_task_header.parent_task_frame.get_data_ptr();
+                                const parent_task_frame_ptr_ =
+                                    @as(*TaskFrame_CombinedView,@ptrCast(@alignCast(parent_task_frame_ptr)));
                                 const prior = @atomicRmw(
                                     u64,
-                                    parent.get_counter_ptr(),
+                                    &parent_task_frame_ptr_.child_task_count,
                                     AtomicRmwOp.Sub,
                                     1,
                                     AtomicOrder.Release);
                                 const last = prior == 1;
                                 if (last) {
                                     @fence(AtomicOrder.Acquire);
-                                    const next_task = parent.*;
-                                    // release park slot
-                                    // release current task frame.
-                                    current_task = next_task;
+                                    current_task.frame_ptr = current_task_header.parent_task_frame;
+                                    current_task.metadata = parent_task_frame_ptr_.park_task_metadata;
                                     state = .Processing;
                                     continue :state_dispath;
                                 } else {
@@ -1198,17 +1200,18 @@ pub const Continuation = struct {
         return this;
     }
 };
-const Task = packed struct {
+const TaskMetadata = packed struct(u64) {
     action_ptr: ptr.CompressedPtr(
         u8,
         ptr.@"Byte amount fitting within 48 bit address space",
         false),
-    meta0: packed struct(u16) {
-        data_alignment_order: u8,
-        frame_layout: FrameType,
-        action_type: ActionType,
-        _pad1: u5
-    },
+    data_alignment_order: u8,
+    frame_layout: FrameType,
+    action_type: ActionType,
+    _pad1: u5
+};
+const Task = packed struct {
+    metadata: TaskMetadata,
     frame_ptr: OpaqueObjectRef,
 
     fn set_fun_ptr(self:*@This(), fptr: *const anyopaque) void {
@@ -1217,7 +1220,7 @@ const Task = packed struct {
             ptr.@"Byte amount fitting within 48 bit address space",
             false) = undefined;
         ptr_.set(@ptrCast(fptr));
-        self.action_ptr = ptr_;
+        self.metadata.action_ptr = ptr_;
     }
     fn get_counter_ptr(self:@This()) *u64 {
         return @as(*u64,@alignCast(@ptrCast(self.frame_ptr.get_data_ptr())));
@@ -1227,13 +1230,13 @@ const Task = packed struct {
         data_ptr: *anyopaque
     } {
         const frame_addr = @intFromPtr(self.frame_ptr.get_data_ptr());
-        const header_size:usize = switch (self.meta0.frame_layout) {
+        const header_size:usize = switch (self.metadata.frame_layout) {
             .Standalone => @sizeOf(TaskFrame_Standalone),
             .ThreadResumer => @sizeOf(TaskFrame_ThreadResumer),
             .TaskResumer => @sizeOf(TaskFrame_TaskResumer)
         };
         const past_header_addr = frame_addr + header_size;
-        const align_order = self.meta0.data_alignment_order;
+        const align_order = self.metadata.data_alignment_order;
         const data_addr =
             if (align_order == 0) past_header_addr
             else std.mem.alignForward(
@@ -1250,8 +1253,8 @@ const Task = packed struct {
         frame_type: FrameType
     ) !struct { header: *anyopaque, data: *anyopaque } {
         self.set_fun_ptr(@ptrCast(operation));
-        self.meta0.action_type = ActionType.Then;
-        self.meta0.frame_layout = frame_type;
+        self.metadata.action_type = ActionType.Then;
+        self.metadata.frame_layout = frame_type;
 
         const task_frame_align : usize = switch (frame_type) {
             .Standalone => @alignOf(TaskFrame_Standalone),
@@ -1265,7 +1268,7 @@ const Task = packed struct {
         };
         const aligned_for_data = std.mem.alignForward(usize, size, capture_align);
         const need_overalign = aligned_for_data - size != 0;
-        self.meta0.data_alignment_order =
+        self.metadata.data_alignment_order =
             if (need_overalign) @ctz(aligned_for_data) else 0 ;
 
         size += capture_size;
@@ -1280,21 +1283,21 @@ const Task = packed struct {
     fn store_continuation(self:*@This(), continuation: Continuation) void {
         switch (continuation.payload) {
             .Then => |next| {
-                self.meta0.action_type = .Then;
+                self.metadata.action_type = .Then;
                 self.set_fun_ptr(next.next_operation);
             },
             .Done => {
-                self.meta0.action_type = .Done;
+                self.metadata.action_type = .Done;
             }
         }
     }
     fn load_continuation(self:*@This()) Continuation {
         var cont : Continuation = undefined;
-        switch (self.meta0.action_type) {
+        switch (self.metadata.action_type) {
             .Then => {
                 const fun = @as(
                     *const fn (*const TaskContext, *anyopaque) Continuation,
-                    @ptrCast(self.action_ptr.get()));
+                    @ptrCast(self.metadata.action_ptr.get()));
                 cont.payload = .{ .Then = .{.next_operation = fun } };
             },
             .Done => {
@@ -1306,7 +1309,7 @@ const Task = packed struct {
 };
 comptime {
     commons.ensure_exact_byte_size(Task, 16);
-    if (@bitOffsetOf(Task, "action_ptr") != 0) @compileError("invalid position");
+    if (@bitOffsetOf(Task, "metadata") != 0) @compileError("invalid position");
     if (@bitOffsetOf(Task, "frame_ptr") != 64) @compileError("invalid position");
 }
 
