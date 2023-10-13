@@ -481,10 +481,57 @@ comptime {
 const OperationState = enum {
     Normal, ShutdownStarted, ShutdownFinished
 };
+const OccupationMap = struct {
+    bits: u64, // 1 for taken, 0 for available
+
+    fn init(self:*@This()) void {
+        @atomicStore(u64, &self.bits, @as(u64,0), .Monotonic);
+    }
+    fn try_find_unoccupied_index(self:*@This()) ?u64 {
+        var bits : u64 = 0;
+        while (true) {
+            const free_index = @ctz(~bits);
+            const all_workers_are_busy = free_index == 64;
+            if (all_workers_are_busy) {
+                // try with outliers
+                return null;
+            }
+            const free_index_bit: u64 = @as(u64,1) << @intCast(free_index);
+            const prior = @atomicRmw(
+                u64,
+                &self.bits,
+                .Or,
+                free_index_bit,
+                .Monotonic);
+            const we_have_it = prior & free_index_bit == 0;
+            if (we_have_it) {
+                return free_index;
+            } else {
+                const no_free_workers = prior != 0;
+                if (no_free_workers) return null;
+                bits = prior;
+                continue;
+            }
+        }
+    }
+    // true if all idle
+    pub fn advertise_as_available(self:*@This(), index: u32) bool {
+        // sets index bit to 0
+        const mask = @as(u64,1) << @intCast(index);
+        const prior_occupation_map = @atomicRmw(
+            u64,
+            &self.bits,
+            AtomicRmwOp.And,
+            ~mask,
+            AtomicOrder.Monotonic);
+        const all_idle = prior_occupation_map & ~mask == 0;
+        return all_idle;
+    }
+};
 pub const WorkGroup = struct {
     host_allocator: Allocator,
     root_allocator: RootAllocator,
-    occupation_registry: u64, // 1 for available, 0 for taken
+    occupation_map: OccupationMap,
     external_ref_count: u32,
     all_idle_mask: u64,
     worker_count: u32,
@@ -499,13 +546,10 @@ pub const WorkGroup = struct {
         var wg : *WorkGroup = @ptrCast(try host_alloc.alloc(WorkGroup, 1));
         try wg.root_allocator.init(host_alloc);
         @atomicStore(u32, &wg.external_ref_count, 1, AtomicOrder.Monotonic);
-        const occupation_bits : usize =
-            if (cpu_count == 64) ~@as(u64,0) else (@as(u64, 1) << @intCast(cpu_count)) - 1;
-        wg.all_idle_mask = occupation_bits;
-        @atomicStore(u64, &wg.occupation_registry, occupation_bits, AtomicOrder.Monotonic);
         wg.host_allocator = host_alloc;
         wg.worker_count = cpu_count;
         @atomicStore(OperationState, &wg.operation_state, .Normal, AtomicOrder.Monotonic);
+        wg.occupation_map.init();
 
         var ix : u32 = 0;
         while (true) {
@@ -543,28 +587,7 @@ pub const WorkGroup = struct {
             if (ix == limit) break;
         }
     }
-    fn try_find_unoccupied_index(self:*@This()) ?u64 {
-        var bits : u64 = (1 << 64) - 1;
-        while (true) {
-            const free_index = @ctz(bits);
-            const free_index_bit: u64 = @as(usize,1) << @intCast(free_index);
-            const prior = @atomicRmw(
-                u64,
-                &self.occupation_registry,
-                AtomicRmwOp.Or,
-                free_index_bit,
-                AtomicOrder.Monotonic);
-            const we_have_it = prior & free_index_bit != 0;
-            if (we_have_it) {
-                return free_index;
-            } else {
-                const no_free_workers = prior == 0;
-                if (no_free_workers) return null;
-                bits = prior;
-                continue;
-            }
-        }
-    }
+
     fn get_worker_at_index(self:*@This(), index: u64) *Worker {
         if (index < 16) {
             return &self.inline_workers[index];
@@ -583,7 +606,7 @@ pub const WorkGroupRef = struct {
     ) !void {
         var resume_flag : atomic.Atomic(u32) = undefined;
         resume_flag.value = 0;
-        if (self.ptr.try_find_unoccupied_index()) |some_index| {
+        if (self.ptr.occupation_map.try_find_unoccupied_index()) |some_index| {
             const free_worker = self.ptr.get_worker_at_index(some_index);
             try free_worker.start(); // idempotent
             free_worker.begin_safe_sync_access();
@@ -697,18 +720,6 @@ pub const Worker = struct {
     }
     pub fn wakeup(self:*const @This()) void {
         std.Thread.Futex.wake(&self.futex_wake_object, 1);
-    }
-    // true if all idle
-    pub fn advertise_as_available(self:*@This()) bool {
-        const mask = @as(u64,1) << @intCast(self.worker_index);
-        const prior_occupation_map = @atomicRmw(
-            u64,
-            &self.work_group_ref.occupation_registry,
-            AtomicRmwOp.Or,
-            mask,
-            AtomicOrder.Monotonic);
-        const all_idle = prior_occupation_map | mask == self.work_group_ref.all_idle_mask;
-        return all_idle;
     }
 };
 const TaskPack = @Vector(16, u128);
@@ -850,6 +861,7 @@ const TaskSet = struct {
 
     fn init(self:*@This()) !void {
         self.inline_tasks.init();
+        self.outline_storage.init();
         self.outline_tasks = try OutlineTasks.initCapacity(std.heap.page_allocator, 16);
         self.current_subindex = 0;
         self.pack_ptr = null;
@@ -1043,7 +1055,7 @@ fn worker_processing_routine(worker: *Worker) void {
                                 export_context.task_set.outline_tasks.items.len != 0;
                             if (overfilled) {
                                 while (true) {
-                                    const mix = worker.work_group_ref.try_find_unoccupied_index();
+                                    const mix = worker.work_group_ref.occupation_map.try_find_unoccupied_index();
                                     if (mix) |ix| {
                                         const mitem = export_context.task_set.outline_tasks.popOrNull();
                                         if (mitem) |item| {
@@ -1109,7 +1121,7 @@ fn worker_processing_routine(worker: *Worker) void {
                 }
             },
             .Sleeping => {
-                const all_idle = worker.advertise_as_available();
+                const all_idle = worker.work_group_ref.occupation_map.advertise_as_available(worker.worker_index);
                 const outcome = @cmpxchgStrong(
                     u32,
                     &worker.work_group_ref.external_ref_count,
@@ -1385,3 +1397,61 @@ test "wg subtasking" {
     try wg.submit_task_and_await(&vals, T.run);
     wg.done_here();
 }
+
+test "wg multisubtasking" {
+    const wg = try WorkGroup.new(std.heap.page_allocator);
+    const Ty = [24]u32;
+    const T = struct {
+        fn run(ctx: *const TaskContext, fooo: **Ty) Continuation {
+            for (fooo.*) |*item| {
+                ctx.spawn_subtask(item,subtask) catch unreachable;
+            }
+            return Continuation.then(&finish);
+        }
+        fn subtask(_:*const TaskContext, data:**u32) Continuation {
+            data.*.* = @as(u32,1);
+            return Continuation.done();
+        }
+        fn finish(_:*const TaskContext, data: **Ty) Continuation {
+            const data_: Ty = data.*.*;
+            var data__ : Ty = undefined;
+            @memset(&data__, 1);
+            const same = std.mem.eql(u32, &data_, &data__);
+            std.testing.expect(same) catch @panic("oops");
+            // std.debug.print("{any}", .{data_});
+            return Continuation.done();
+        }
+    };
+    var vals : Ty = undefined;
+    @memset(&vals, 0);
+    try wg.submit_task_and_await(&vals, T.run);
+    wg.done_here();
+}
+
+// fn huii(v:*u32, f:*u32) void {
+//     while (true) {
+//         var bits : u32 = 1;
+//         const ix = @ctz(bits);
+//         const mask = @as(u32, 1) << @intCast(ix);
+//         const prior = @atomicRmw(u32, v, .And, ~mask, .Monotonic);
+//         if (prior & mask != 0) {
+//             continue;
+//         }
+//         const outcome = @cmpxchgStrong(u32, f, 0, prior, .Monotonic, .Monotonic);
+//         if (outcome) |smth| {
+//             var buf : [256]u8 = undefined;
+//             const msg = std.fmt.bufPrint(&buf, "bitch!! found {} == prior {}", .{smth, prior}) catch @panic("shit");
+//             std.testing.expect(smth != prior) catch @panic(msg);
+//         }
+//         break;
+//     }
+// }
+// test "hui" {
+//     for (0 .. 1_000_000) |_| {
+//         var i : u32 = ~@as(u32, 0);
+//         var found : u32 = 0;
+//         _ = try std.Thread.spawn(.{}, huii, .{&i, &found});
+//         _ = try std.Thread.spawn(.{}, huii, .{&i, &found});
+//     }
+//     std.time.sleep(1000 * 1000 * 1000);
+// }
